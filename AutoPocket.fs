@@ -253,12 +253,13 @@ export const autoPocket = defineFeature(function(context is Context, id is Id, d
             }
             else
             {
-                // Voronoi: holes, cutouts and forced points are seeds whose cells get split by spokes.
+                // Voronoi: forced points are seeds whose cells get split by spokes. Holes and cutouts only push
+                // the generated nodes away so cells stay even; they get tied to the ribs afterwards.
                 fixed = concatenateArrays([holeCenters, cutCenters, forced]);
-                const s = sqrt(2 * faceArea / (sqrt(3) * max(N + size(fixed), 1)));
+                const s = sqrt(2 * faceArea / (sqrt(3) * max(N + size(forced), 1)));
                 const gen = generateNodes(ctx, geo, fixed, N, s, angle, layout, rng, 2.0, w);
                 var seeds = [];
-                for (var p in fixed)
+                for (var p in forced)
                 {
                     seeds = append(seeds, p);
                     spoke = append(spoke, true);
@@ -279,14 +280,29 @@ export const autoPocket = defineFeature(function(context is Context, id is Id, d
             var g = sqrt(2 * faceArea / (sqrt(3) * max(N, 1)));
             if (isQuad)
                 g = sqrt(faceArea / max(N, 1));
-            const specials = concatenateArrays([holeCenters, cutCenters, forced]);
+            // Holes well inside the face that sit close to a grid node pull it onto themselves. Other holes and
+            // cutouts stay out of the grid so it stays regular; they get tied to the ribs afterwards.
+            var specials = [];
+            for (var h in geo.holes)
+            {
+                if (minDistSegs([h[0], h[1]], geo.outerSegs) - h[2] - bossW - b > g / 2)
+                    specials = append(specials, [h[0], h[1]]);
+            }
+            specials = concatenateArrays([specials, forced]);
             const lat = makeLattice(ctx, g, angle, isQuad);
-            const snap = snapSpecials(lat.pts, specials, 0.45 * g);
+            const snap = snapSpecials(lat.pts, specials, 0.25 * g);
+            // Only forced points that missed the grid become extra nodes.
+            var extra = [];
+            for (var p in snap.unsnapped)
+            {
+                if (size(forced) > 0 && minDistPts(p, forced) < 1e-9)
+                    extra = append(extra, p);
+            }
             if (pattern == PocketPattern.HEX)
             {
                 var seeds = snap.pts;
                 var spoke = snap.snapped;
-                for (var p in snap.unsnapped)
+                for (var p in extra)
                 {
                     seeds = append(seeds, p);
                     spoke = append(spoke, true);
@@ -296,17 +312,21 @@ export const autoPocket = defineFeature(function(context is Context, id is Id, d
             }
             else
             {
-                nodes = concatenateArrays([snap.pts, snap.unsnapped]);
+                nodes = concatenateArrays([snap.pts, extra]);
                 cells = latticeCells(lat, snap.pts, isQuad);
-                cells = splitCellsAtPoints(cells, snap.unsnapped);
+                cells = splitCellsAtPoints(cells, extra);
             }
         }
+
+        var ties = [];
+        if (pattern != PocketPattern.TRIANGLES)
+            ties = holeTies(cells, ctx, w);
 
         const pk = buildPockets(cells, ctx, w, r, minSize);
 
         if (definition.previewOnly)
         {
-            drawPreview(context, cSys, nodes, cells, pk.paths, pk.skipped, ctx);
+            drawPreview(context, cSys, nodes, cells, pk.paths, pk.skipped, ties, ctx);
             var pmsg = "Preview: " ~ size(nodes) ~ " nodes, " ~ size(pk.paths) ~ " candidate pockets, " ~ pk.small ~ " cells too small";
             if (nMerged > 0)
                 pmsg = pmsg ~ ", " ~ nMerged ~ " small triangles merged into a neighbour";
@@ -393,6 +413,8 @@ export const autoPocket = defineFeature(function(context is Context, id is Id, d
         if (bossW > 0)
             for (var hh in geo.holes)
                 shapes = append(shapes, circleShape([hh[0], hh[1]], hh[2] + bossW));
+        for (var tie in ties)
+            shapes = append(shapes, stadiumShape(tie[0], tie[1], w / 2));
 
         // Shapes that overlap go in different sketches so no sketch ever encloses an empty region.
         // All sketches first: operations under the "keep" id must run back to back.
@@ -1571,6 +1593,110 @@ function voronoiCells(seeds is array, spoke is array) returns array
     return cells;
 }
 
+// A hole's boss or a cutout's border that sits inside a pocket, clear of every rib and of the border, would
+// float. Each such one gets a single tie (a rib, as [from, to]) to whichever is closer: the nearest rib
+// centerline or the face's edge.
+function holeTies(cells is array, ctx is map, w is number) returns array
+{
+    var ribSegs = [];
+    for (var cell in cells)
+    {
+        const n = size(cell);
+        for (var k = 0; k < n; k += 1)
+            ribSegs = append(ribSegs, [cell[k][0], cell[k][1], cell[(k + 1) % n][0], cell[(k + 1) % n][1]]);
+    }
+    var ties = [];
+    if (ctx.boss > 0)
+    {
+        for (var h in ctx.holes)
+        {
+            const c = [h[0], h[1]];
+            const band = h[2] + ctx.boss;
+            const rib = nearestOnSegs(c, ribSegs);
+            const edge = nearestOnSegs(c, ctx.outerSegs);
+            const tie = pickTie(c, rib, rib.d - band - w / 2, c, edge, edge.d - band - ctx.b);
+            if (tie != undefined)
+                ties = append(ties, tie);
+        }
+    }
+    if (ctx.cb > 0)
+    {
+        for (var cs in ctx.cutouts)
+        {
+            const rib = nearestBetween(cs, ribSegs);
+            const edge = nearestBetween(cs, ctx.outerSegs);
+            const tie = pickTie(rib.from, rib, rib.d - ctx.cb - w / 2, edge.from, edge, edge.d - ctx.cb - ctx.b);
+            if (tie != undefined)
+                ties = append(ties, tie);
+        }
+    }
+    return ties;
+}
+
+// No tie when the band already reaches a rib or the border; otherwise tie to the closer of the two.
+function pickTie(ribFrom, rib is map, ribGap is number, edgeFrom, edge is map, edgeGap is number)
+{
+    if (ribGap <= 0 || edgeGap <= 0)
+        return undefined;
+    if (ribGap <= edgeGap)
+        return [ribFrom, rib.p];
+    return [edgeFrom, edge.p];
+}
+
+// Closest point to p on any of segs, with its distance.
+function nearestOnSegs(p, segs is array) returns map
+{
+    var best = { "d" : BIG, "p" : p };
+    for (var s in segs)
+    {
+        const q = closestOnSeg(p, s);
+        const d = sqrt(dist2(p, q));
+        if (d < best.d)
+            best = { "d" : d, "p" : q };
+    }
+    return best;
+}
+
+// Closest pair between segment sets A and B: "from" on A, "p" on B, and their distance.
+function nearestBetween(A is array, B is array) returns map
+{
+    var best = { "d" : BIG, "from" : [A[0][0], A[0][1]], "p" : [A[0][0], A[0][1]] };
+    for (var s in A)
+    {
+        for (var t in B)
+        {
+            if (segsIntersect(s, t))
+                return { "d" : 0, "from" : [s[0], s[1]], "p" : [s[0], s[1]] };
+            for (var a in [[s[0], s[1]], [s[2], s[3]]])
+            {
+                const q = closestOnSeg(a, t);
+                const d = sqrt(dist2(a, q));
+                if (d < best.d)
+                    best = { "d" : d, "from" : a, "p" : q };
+            }
+            for (var e in [[t[0], t[1]], [t[2], t[3]]])
+            {
+                const q = closestOnSeg(e, s);
+                const d = sqrt(dist2(e, q));
+                if (d < best.d)
+                    best = { "d" : d, "from" : q, "p" : e };
+            }
+        }
+    }
+    return best;
+}
+
+function closestOnSeg(p, s)
+{
+    const dx = s[2] - s[0];
+    const dy = s[3] - s[1];
+    const l2 = dx * dx + dy * dy;
+    var t = 0;
+    if (l2 > 0)
+        t = min(1, max(0, ((p[0] - s[0]) * dx + (p[1] - s[1]) * dy) / l2));
+    return [s[0] + t * dx, s[1] + t * dy];
+}
+
 // ======================================================================== pocket outlines
 
 // Inset each cell by half a rib, round its corners with the fillet radius, and drop ones that are too small.
@@ -2028,7 +2154,7 @@ function colorShapes(shapes is array) returns array
 // ======================================================================== preview
 
 function drawPreview(context is Context, cSys is CoordSystem, nodes is array, cells is array, paths is array, skipped is array,
-    ctx is map)
+    ties is array, ctx is map)
 {
     const toW = function(p)
         {
@@ -2073,6 +2199,8 @@ function drawPreview(context is Context, cSys is CoordSystem, nodes is array, ce
             }
         }
     }
+    for (var tie in ties)
+        addDebugLine(context, toW(tie[0]), toW(tie[1]), DebugColor.RED);
     // Cells left solid get an orange star from their center to each corner.
     for (var C in skipped)
     {

@@ -40,10 +40,12 @@ it keeps working; you can bump both numbers on lines 1-2 to the version a new Fe
 
 ## How holes and cutouts are handled
 
-- **Circular holes** are nodes with a boss ring. In Triangles mode ribs run straight to them; in Voronoi
-  and Hex mode the hole's cell is split by spokes; in Isogrid and Quad mode the nearest grid node snaps
-  onto the hole, or the cell is split by spokes when it is too far to snap.
-- **Other cutouts** get a border, and ribs tie into that border.
+- **Circular holes** get a boss ring. In Triangles mode they are nodes and ribs run straight to them.
+  In the other patterns they never distort the cells: a hole well inside the face that sits within a
+  quarter cell of a grid node pulls that node onto itself (Hex, Isogrid, Quad); every other hole stays
+  where it lands, and if its boss would float inside a pocket it gets one short tie to the nearest rib or
+  to the border.
+- **Other cutouts** get a border, tied in the same way when it would float.
 - A pocket that would leave a floating island (for example around a keep-out) stays solid instead.
 
 ## Small triangles
